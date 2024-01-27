@@ -3,6 +3,7 @@ members = [
     "opentelemetry-aws",
     "opentelemetry-contrib",
     "opentelemetry-datadog",
+    "opentelemetry-datadog-api",
     "opentelemetry-stackdriver",
     "opentelemetry-user-events-logs",
     "opentelemetry-user-events-metrics",
@@ -12,6 +13,7 @@ members = [
 ]
 exclude = [
     "opentelemetry-datadog",
+    "opentelemetry-datadog-api",
     "opentelemetry-stackdriver",
 ]
 resolver = "2"
@@ -30,3 +32,9 @@ opentelemetry-proto = { version = "0.5", default-features = false }
 opentelemetry_sdk = { version = "0.22", default-features = false }
 opentelemetry-stdout = "0.3"
 opentelemetry-semantic-conventions = "0.14"
+
+[patch.crates-io]
+reqwest = { git = "https://github.com/grafbase/reqwest", rev = "3f7d91b5b6aa936fafdb7629d92f1bd1a5720d86" } # hyper-v1-with-patches
+opentelemetry = { git = "https://github.com/grafbase/opentelemetry-rust", rev = "962cd6c1761a0b58aa65c6cbc626c91d735fd947" } # http-v1-as-any-rebased
+opentelemetry_sdk = { git = "https://github.com/grafbase/opentelemetry-rust", rev = "962cd6c1761a0b58aa65c6cbc626c91d735fd947" } # http-v1-as-any-rebased
+opentelemetry-http = { git = "https://github.com/grafbase/opentelemetry-rust", rev = "962cd6c1761a0b58aa65c6cbc626c91d735fd947" } # http-v1-as-any-rebased
