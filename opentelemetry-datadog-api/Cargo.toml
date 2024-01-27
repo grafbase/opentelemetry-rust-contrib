@@ -1,0 +1,44 @@
+[package]
+name = "opentelemetry-datadog-api"
+version = "0.12.0"
+description = "Datadog exporters and propagators for OpenTelemetry for Cloudflare workers"
+homepage = "https://github.com/grafbase/opentelemetry-datadog-cloudflare/"
+repository = "https://github.com/grafbase/opentelemetry-datadog-cloudflare/"
+readme = "README.md"
+categories = ["development-tools::debugging", "development-tools::profiling"]
+keywords = ["opentelemetry", "tracing", "cloudflare", "worker", "datadog"]
+license = "Apache-2.0"
+edition = "2021"
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+
+[features]
+reqwest-client = ["reqwest", "reqwest/stream"]
+
+[dependencies]
+async-trait = "0.1"
+http = "1"
+itertools = "0.13"
+lazy_static = "1"
+opentelemetry = { version = "0.23", features = ["trace"] }
+opentelemetry_sdk = { version = "0.23", features = ["trace"] }
+opentelemetry-semantic-conventions = { version = "0.15" }
+prost = { version = "0.12", features = ["std"] }
+reqwest = { version = "0.12", default-features = false, optional = true }
+send_wrapper = { version = "0.6", features = ["futures"] }
+thiserror = "1.0"
+
+[build-dependencies]
+prost-build = { version = "0.12" }
+tonic-build = { version = "0.11", features = ["transport", "prost"] }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+reqwest = { version = "0.12", default-features = false }
+getrandom = { version = "0.2", features = ["js"] }
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+reqwest = { version = "0.12", default-features = false, features = [
+  "__rustls",
+] }
