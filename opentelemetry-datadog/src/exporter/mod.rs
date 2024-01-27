@@ -212,7 +212,9 @@ impl DatadogPipelineBuilder {
                 cfg.resource = Cow::Owned(Resource::new(
                     cfg.resource
                         .iter()
-                        .filter(|(k, _v)| k.as_str() != semcov::resource::SERVICE_NAME)
+                        .filter(|(k, _v)| {
+                            k.as_str() != String::from(semcov::resource::SERVICE_NAME)
+                        })
                         .map(|(k, v)| KeyValue::new(k.clone(), v.clone())),
                 ));
                 cfg

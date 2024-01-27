@@ -4,6 +4,7 @@ members = [
     "opentelemetry-contrib",
 # TODO: Add back in once this relies on a published version
 #    "opentelemetry-datadog",
+     "opentelemetry-datadog-api",
 # TODO: Add back in once this relies on a published version
 #    "opentelemetry-stackdriver",
     "opentelemetry-user-events-logs",
@@ -23,3 +24,10 @@ resolver = "2"
 # See function names in profiling reports.
 # 2/true is too much, 0 is not enough, 1 is just right for back traces
 debug = 1
+
+[patch.crates-io]
+hyper-util = { git = "https://github.com/grafbase/hyper-util", rev = "c7acf8968d96a4408e952a097d93602d2e8ed01a" }
+reqwest = { git = "https://github.com/grafbase/reqwest", rev = "9d8f00dbfa2274e6cf7061aa97ffc8677167a729" } # hyper-v1-and-wasm-from-parts-build-split
+opentelemetry = { git = "https://github.com/grafbase/opentelemetry-rust", rev = "1edea21a8101ee176ee17268d3bbedec26797b0d" } # http-v1-as-any
+opentelemetry_sdk = { git = "https://github.com/grafbase/opentelemetry-rust", rev = "1edea21a8101ee176ee17268d3bbedec26797b0d" } # http-v1-as-any
+opentelemetry-http = { git = "https://github.com/grafbase/opentelemetry-rust", rev = "1edea21a8101ee176ee17268d3bbedec26797b0d" } # http-v1-as-any
