@@ -31,6 +31,7 @@ use std::time::{Duration, SystemTime};
 
 use crate::dd_proto;
 
+use crate::dd_proto::SpanLink;
 #[cfg(not(feature = "reqwest-client"))]
 use reqwest as _;
 use reqwest::Client;
@@ -313,7 +314,7 @@ impl DatadogPipelineBuilder {
         TraceError,
     > {
         let (config, service_name) = self.build_config_and_service_name();
-        let exporter = self.build_exporter_with_service_name(service_name)?;
+        let exporter = self.build_exporter_with_service_name(service_name.clone())?;
         let flush_size = exporter.flush_size;
         let span_processor = WASMWorkerSpanProcessor::new(exporter, flush_size);
         let mut provider_builder =
@@ -324,7 +325,7 @@ impl DatadogPipelineBuilder {
             "opentelemetry-datadog-api",
             Some(env!("CARGO_PKG_VERSION")),
             None::<String>,
-            None,
+            Some(vec![KeyValue::new("service", service_name)]),
         );
 
         Ok((tracer, provider))
@@ -444,12 +445,7 @@ fn trace_into_dd_tracer_payload(exporter: &DatadogExporter, trace: SpanData) -> 
     let parent_id = trace.parent_span_id;
     let parent_id = u64::from_be_bytes(parent_id.to_bytes());
 
-    let resource = trace
-        .attributes
-        .iter()
-        .find(|key_value| key_value.key.as_str() == "code.namespace")
-        .map(|key_value| key_value.value.as_str().to_string())
-        .unwrap_or_default();
+    let span_name = trace.name;
     let [t0, _t1] = u128_to_u64s(u128::from_be_bytes(trace_id.to_bytes()));
 
     #[allow(clippy::cast_possible_truncation)]
@@ -465,33 +461,54 @@ fn trace_into_dd_tracer_payload(exporter: &DatadogExporter, trace: SpanData) -> 
         .unwrap_or_default()
         .as_nanos() as i64;
 
-    let meta = trace
+    let mut meta = trace
         .attributes
         .into_iter()
         .map(|key_value| (key_value.key.to_string(), key_value.value.to_string()))
         .collect::<BTreeMap<String, String>>();
 
+    meta.extend(exporter.tags.clone());
+
     dd_proto::Span {
         service: exporter.service_name.clone(),
-        name: trace.name.to_string(),
-        resource,
+        name: span_name.to_string(),
+        resource: span_name.to_string(),
         r#type: "http".to_string(),
         trace_id: t0,
         span_id,
         parent_id,
+        start,
+        duration,
         error: match trace.status {
             Status::Unset | Status::Ok => 0,
             Status::Error { .. } => 1,
         },
-        start,
-        duration,
         meta,
         metrics: BTreeMap::new(),
         meta_struct: BTreeMap::new(),
+        span_links: trace
+            .links
+            .into_iter()
+            .map(|link| SpanLink {
+                trace_id: u128::from_be_bytes(link.span_context.trace_id().to_bytes()) as u64,
+                trace_id_high: 0,
+                span_id: u64::from_be_bytes(link.span_context.span_id().to_bytes()),
+                attributes: link
+                    .attributes
+                    .into_iter()
+                    .map(|kv| (kv.key.to_string(), kv.value.to_string()))
+                    .collect(),
+                tracestate: link.span_context.trace_state().header(),
+                flags: u32::from(link.span_context.trace_flags().to_u8()),
+            })
+            .collect(),
     }
 }
 
-fn trace_into_chunk(spans: Vec<dd_proto::Span>) -> dd_proto::TraceChunk {
+fn trace_into_chunk(
+    tags: BTreeMap<String, String>,
+    spans: Vec<dd_proto::Span>,
+) -> dd_proto::TraceChunk {
     dd_proto::TraceChunk {
         // This should not happen for Datadog originated traces, but in case this field is not populated
         // we default to 1 (https://github.com/DataDog/datadog-agent/blob/eac2327/pkg/trace/sampler/sampler.go#L54-L55),
@@ -500,7 +517,7 @@ fn trace_into_chunk(spans: Vec<dd_proto::Span>) -> dd_proto::TraceChunk {
         priority: 100i32,
         origin: "lambda".to_string(),
         spans,
-        tags: BTreeMap::new(),
+        tags,
         dropped_trace: false,
     }
 }
@@ -514,21 +531,25 @@ impl DatadogExporter {
             tracer_version: VERSION.to_string(),
             runtime_id: self.runtime_id.clone(),
             chunks,
+            tags: self.tags.clone(),
+            env: self.env.clone(),
+            hostname: self.host_name.clone(),
             app_version: self.app_version.clone(),
         }
     }
 
-    fn trace_build(&self, tracer: Vec<dd_proto::TracerPayload>) -> dd_proto::TracePayload {
-        dd_proto::TracePayload {
+    fn trace_build(&self, tracer: Vec<dd_proto::TracerPayload>) -> dd_proto::AgentPayload {
+        let tags = self.tags.clone();
+
+        dd_proto::AgentPayload {
             host_name: self.host_name.clone(),
             env: self.env.clone(),
-            traces: vec![],
-            transactions: vec![],
             tracer_payloads: tracer,
-            tags: self.tags.clone(),
+            tags,
             agent_version: VERSION.to_string(),
             target_tps: 1000f64,
             error_tps: 1000f64,
+            rare_sampler_enabled: false,
         }
     }
 }
@@ -536,13 +557,14 @@ impl DatadogExporter {
 impl DatadogExporter {
     /// Export spans to datadog
     // TODO: Should split & batch them when it's too big, check Vector reference.
-    fn export(&self, batch: Vec<SpanData>) -> impl Future<Output = trace::ExportResult> + Send {
+    pub fn export(&self, batch: Vec<SpanData>) -> impl Future<Output = trace::ExportResult> + Send {
         let traces: Vec<Vec<SpanData>> = group_into_traces(batch);
 
         let chunks: Vec<dd_proto::TraceChunk> = traces
             .into_iter()
             .map(|spans| {
                 trace_into_chunk(
+                    self.tags.clone(),
                     spans
                         .into_iter()
                         .map(|trace| trace_into_dd_tracer_payload(self, trace))
