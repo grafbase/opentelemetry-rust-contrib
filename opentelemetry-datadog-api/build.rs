@@ -1,11 +1,10 @@
 fn main() {
     // Always rerun if the build script itself changes.
     println!("cargo:rerun-if-changed=build.rs");
-
-    println!("cargo:rerun-if-changed=proto/dd_trace.proto");
-    println!("cargo:rerun-if-changed=proto/ddsketch_full.proto");
-    println!("cargo:rerun-if-changed=proto/dd_metric.proto");
-    println!("cargo:rerun-if-changed=proto/google/pubsub/v1/pubsub.proto");
+    println!("cargo:rerun-if-changed=proto/agent_payload.proto");
+    println!("cargo:rerun-if-changed=proto/span.proto");
+    println!("cargo:rerun-if-changed=proto/stats.proto");
+    println!("cargo:rerun-if-changed=proto/tracer_payload.proto");
 
     let mut prost_build = prost_build::Config::new();
     prost_build.btree_map(["."]);
@@ -14,10 +13,10 @@ fn main() {
         .compile_with_config(
             prost_build,
             &[
-                "proto/ddsketch_full.proto",
-                "proto/dd_metric.proto",
-                "proto/dd_trace.proto",
-                "proto/google/pubsub/v1/pubsub.proto",
+                "proto/agent_payload.proto",
+                "proto/span.proto",
+                "proto/stats.proto",
+                "proto/tracer_payload.proto",
             ],
             &["proto/"],
         )
