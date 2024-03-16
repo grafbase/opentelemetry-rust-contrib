@@ -31,14 +31,16 @@ use std::time::{Duration, SystemTime};
 
 use crate::dd_proto;
 
-use crate::dd_proto::SpanLink;
+use crate::dd_proto::{ClientGroupedStats, ClientStatsBucket, ClientStatsPayload, SpanLink};
 #[cfg(not(feature = "reqwest-client"))]
 use reqwest as _;
-use reqwest::Client;
+use reqwest::{Client, RequestBuilder};
 
 const DEFAULT_SITE_ENDPOINT: &str = "https://trace.agent.datadoghq.eu/";
 const DEFAULT_DD_TRACES_PATH: &str = "api/v0.2/traces";
-const DEFAULT_DD_CONTENT_TYPE: &str = "application/x-protobuf";
+const DEFAULT_DD_STATS_PATH: &str = "api/v0.2/stats";
+const TRACES_DD_CONTENT_TYPE: &str = "application/x-protobuf";
+const STATS_DD_CONTENT_TYPE: &str = "application/msgpack";
 const DEFAULT_DD_API_KEY_HEADER: &str = "DD-Api-Key";
 const DEFAULT_FLUSH_SIZE: usize = 500;
 
@@ -53,7 +55,8 @@ thread_local! {
 #[allow(clippy::module_name_repetitions)]
 pub struct DatadogExporter {
     client: Arc<Client>,
-    request_url: Uri,
+    trace_request_url: Uri,
+    stats_request_url: Uri,
     service_name: String,
     env: String,
     tags: BTreeMap<String, String>,
@@ -69,7 +72,8 @@ impl DatadogExporter {
     #[allow(clippy::too_many_arguments)]
     fn new(
         service_name: String,
-        request_url: Uri,
+        stats_request_url: Uri,
+        trace_request_url: Uri,
         client: Arc<Client>,
         key: String,
         env: String,
@@ -82,7 +86,8 @@ impl DatadogExporter {
     ) -> Self {
         DatadogExporter {
             client,
-            request_url,
+            stats_request_url,
+            trace_request_url,
             service_name,
             env,
             tags,
@@ -277,10 +282,12 @@ impl DatadogPipelineBuilder {
         service_name: String,
     ) -> Result<DatadogExporter, TraceError> {
         if let Some(client) = self.client {
-            let endpoint = self.agent_endpoint + DEFAULT_DD_TRACES_PATH;
+            let traces_endpoint = self.agent_endpoint.clone() + DEFAULT_DD_TRACES_PATH;
+            let stats_endpoint = self.agent_endpoint + DEFAULT_DD_STATS_PATH;
             let exporter = DatadogExporter::new(
                 service_name,
-                endpoint.parse().map_err::<Error, _>(Into::into)?,
+                stats_endpoint.parse().map_err::<Error, _>(Into::into)?,
+                traces_endpoint.parse().map_err::<Error, _>(Into::into)?,
                 client,
                 self.api_key
                     .ok_or_else(|| TraceError::Other("APIKey not provied".into()))?,
@@ -472,6 +479,7 @@ fn trace_into_dd_tracer_payload(exporter: &DatadogExporter, trace: SpanData) -> 
         .collect::<BTreeMap<String, String>>();
 
     meta.extend(exporter.tags.clone());
+    meta.insert("_dd.apm.enabled".to_string(), 0.to_string());
 
     dd_proto::Span {
         service: exporter.service_name.clone(),
@@ -510,9 +518,11 @@ fn trace_into_dd_tracer_payload(exporter: &DatadogExporter, trace: SpanData) -> 
 }
 
 fn trace_into_chunk(
-    tags: BTreeMap<String, String>,
+    mut tags: BTreeMap<String, String>,
     spans: Vec<dd_proto::Span>,
 ) -> dd_proto::TraceChunk {
+    tags.insert("_dd.apm.enabled".to_string(), 0.to_string());
+
     dd_proto::TraceChunk {
         // This should not happen for Datadog originated traces, but in case this field is not populated
         // we default to 1 (https://github.com/DataDog/datadog-agent/blob/eac2327/pkg/trace/sampler/sampler.go#L54-L55),
@@ -543,7 +553,8 @@ impl DatadogExporter {
     }
 
     fn trace_build(&self, tracer: Vec<dd_proto::TracerPayload>) -> dd_proto::AgentPayload {
-        let tags = self.tags.clone();
+        let mut tags = self.tags.clone();
+        tags.insert("_dd.apm.enabled".to_string(), 0.to_string());
 
         dd_proto::AgentPayload {
             host_name: self.host_name.clone(),
@@ -561,7 +572,10 @@ impl DatadogExporter {
 impl DatadogExporter {
     /// Export spans to datadog
     // TODO: Should split & batch them when it's too big, check Vector reference.
-    pub fn export(&self, batch: Vec<SpanData>) -> impl Future<Output = trace::ExportResult> + Send {
+    pub fn export(
+        &self,
+        batch: Vec<SpanData>,
+    ) -> impl Future<Output = trace::ExportResult> + Send + '_ {
         let traces: Vec<Vec<SpanData>> = group_into_traces(batch);
 
         let chunks: Vec<dd_proto::TraceChunk> = traces
@@ -577,32 +591,128 @@ impl DatadogExporter {
             })
             .collect();
 
+        let client_stats = chunks
+            .iter()
+            .map(|chunk| {
+                let root = chunk.spans.first();
+                let leaf = chunk.spans.last();
+
+                let client_group_stats = chunk
+                    .spans
+                    .iter()
+                    .group_by(|span| &span.name)
+                    .into_iter()
+                    .map(|(span_name, grouped_by_span_name)| {
+                        grouped_by_span_name
+                            .group_by(|span| {
+                                span.meta
+                                    .get("http.response.status_code")
+                                    .or_else(|| span.meta.get("http.status_code"))
+                            })
+                            .into_iter()
+                            .map(|(http_status, spans)| {
+                                let status: http::StatusCode = http_status
+                                    .and_then(|status| status.parse().ok())
+                                    .unwrap_or_default();
+                                let hits = spans.size_hint().0;
+                                let errors = if status.is_success() { 0 } else { hits };
+
+                                spans.into_iter().map(move |named_span_with_status| {
+                                    ClientGroupedStats {
+                                        service: named_span_with_status.service.clone(),
+                                        name: span_name.to_string(),
+                                        resource: named_span_with_status.resource.clone(),
+                                        http_status_code: status.as_u16() as u32,
+                                        r#type: named_span_with_status.r#type.to_string(),
+                                        hits: hits as u64,
+                                        errors: errors as u64,
+                                        duration: named_span_with_status.duration as u64,
+                                        ..Default::default()
+                                    }
+                                })
+                            })
+                            .flatten()
+                            .collect_vec()
+                    })
+                    .flatten()
+                    .collect_vec();
+
+                ClientStatsPayload {
+                    hostname: self.host_name.clone(),
+                    env: self.env.clone(),
+                    version: self.app_version.clone(),
+                    stats: vec![ClientStatsBucket {
+                        start: root.map(|root| root.start).unwrap_or_default() as u64,
+                        duration: leaf.map(|leaf| leaf.duration).unwrap_or_default() as u64,
+                        stats: client_group_stats,
+                        ..Default::default()
+                    }],
+                    lang: "rust".to_string(),
+                    tracer_version: VERSION.to_string(),
+                    runtime_id: "cloudflare".to_string(),
+                    service: self.service_name.clone(),
+                    container_id: "cloudflare".to_string(),
+                    ..Default::default()
+                }
+            })
+            .collect_vec();
+
         let traces = self.trace_into_tracer(chunks);
+
+        let stats = dd_proto::StatsPayload {
+            agent_hostname: self.host_name.clone(),
+            agent_env: self.env.clone(),
+            stats: client_stats,
+            agent_version: VERSION.to_string(),
+            client_computed: false,
+            split_payload: false,
+        };
+
+        let stats = model::encode_stats(stats).map_err(|err| TraceError::from(err));
 
         let trace = self.trace_build(vec![traces]);
         let trace = trace.encode_to_vec();
 
-        let request = self
-            .client
-            .post(self.request_url.to_string())
-            .header(http::header::CONTENT_TYPE, DEFAULT_DD_CONTENT_TYPE)
-            .header("X-Datadog-Reported-Languages", "rust")
-            .header(DEFAULT_DD_API_KEY_HEADER, self.key.clone())
-            .body(trace);
-
         SendWrapper::new(async move {
-            let response = match request.send().await {
-                Ok(response) => response,
-                Err(e) => return Err(TraceError::from(e.to_string())),
-            };
+            let trace_request = self
+                .client
+                .post(self.trace_request_url.to_string())
+                .header(http::header::CONTENT_TYPE, TRACES_DD_CONTENT_TYPE)
+                .header("X-Datadog-Reported-Languages", "rust")
+                .header(DEFAULT_DD_API_KEY_HEADER, self.key.clone())
+                .body(trace);
 
-            if !response.status().is_success() {
-                return match response.text().await {
-                    Ok(text) => Err(TraceError::from(text)),
-                    Err(e) => Err(TraceError::from(e.to_string())),
-                };
+            send_request(trace_request).await?;
+
+            if let Ok(stats) = stats {
+                let stats_request = self
+                    .client
+                    .post(self.stats_request_url.to_string())
+                    .header(http::header::CONTENT_TYPE, STATS_DD_CONTENT_TYPE)
+                    .header("X-Datadog-Reported-Languages", "rust")
+                    .header(DEFAULT_DD_API_KEY_HEADER, self.key.clone())
+                    .body(stats);
+
+                send_request(stats_request).await?;
             }
+
             Ok(())
         })
     }
+}
+
+async fn send_request(request: RequestBuilder) -> Result<(), TraceError> {
+    let response = match request.send().await {
+        Ok(response) => response,
+        Err(e) => return Err(TraceError::from(e.to_string())),
+    };
+
+    if !response.status().is_success() {
+        return match response.text().await {
+            Ok(text) => Err(TraceError::from(text)),
+            Err(e) => Err(TraceError::from(e.to_string())),
+        };
+    }
+
+    Ok(())
 }
