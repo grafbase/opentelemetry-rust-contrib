@@ -529,7 +529,7 @@ fn trace_into_chunk(
         // which is what the Datadog trace-agent is doing for OTLP originated traces, as per
         // https://github.com/DataDog/datadog-agent/blob/3ea2eb4/pkg/trace/api/otlp.go#L309.
         priority: 100i32,
-        origin: "lambda".to_string(),
+        origin: "rum".to_string(),
         spans,
         tags,
         dropped_trace: false,
