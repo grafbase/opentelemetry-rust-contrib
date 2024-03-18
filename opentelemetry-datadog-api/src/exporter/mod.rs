@@ -533,7 +533,7 @@ fn trace_into_chunk(
         // which is what the Datadog trace-agent is doing for OTLP originated traces, as per
         // https://github.com/DataDog/datadog-agent/blob/3ea2eb4/pkg/trace/api/otlp.go#L309.
         priority: 100i32,
-        origin: "rum".to_string(),
+        origin: "lambda".to_string(),
         spans,
         tags,
         dropped_trace: false,
@@ -594,8 +594,8 @@ impl DatadogExporter {
             })
             .collect();
 
-        let client_stats = self.compute_client_stats_for_chunks(chunks.iter());
         mark_root_spans(&mut chunks);
+        let client_stats = self.compute_client_stats_for_chunks(chunks.iter());
 
         let traces = self.trace_into_tracer(chunks);
 
@@ -680,6 +680,7 @@ impl DatadogExporter {
                                         hits: hits as u64,
                                         errors: errors as u64,
                                         duration: named_span_with_status.duration as u64,
+                                        peer_tags: vec!["_dd.base_service".to_string()],
                                         ..Default::default()
                                     }
                                 })
@@ -744,6 +745,18 @@ fn mark_root_spans(trace_chunks: &mut Vec<TraceChunk>) {
             })
             .for_each(|span| {
                 span.metrics.insert("_top_level".to_string(), 1.0);
+                span.metrics.insert("_dd.agent_psr".to_string(), 1.0);
+                span.metrics
+                    .insert("_sampling_priority_v1".to_string(), 1.0);
+                span.metrics.insert("_dd.measured".to_string(), 1.0);
+
+                span.meta
+                    .insert("_dd.base_service".to_string(), span.service.clone());
+                span.meta
+                    .insert("_dd.compute_stats".to_string(), "1".to_string());
+                span.meta
+                    .insert("_dd.origin".to_string(), "lambda".to_string());
+                span.meta.insert("_dd.p.dm".to_string(), "-0".to_string());
             })
     }
 }
