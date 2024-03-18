@@ -23,7 +23,7 @@ use opentelemetry_semantic_conventions as semcov;
 use prost::Message;
 use send_wrapper::SendWrapper;
 use std::cell::RefCell;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::convert::TryInto;
 use std::future::Future;
 use std::sync::Arc;
@@ -31,7 +31,7 @@ use std::time::{Duration, SystemTime};
 
 use crate::dd_proto;
 
-use crate::dd_proto::SpanLink;
+use crate::dd_proto::{SpanLink, TraceChunk};
 #[cfg(not(feature = "reqwest-client"))]
 use reqwest as _;
 use reqwest::Client;
@@ -564,7 +564,7 @@ impl DatadogExporter {
     pub fn export(&self, batch: Vec<SpanData>) -> impl Future<Output = trace::ExportResult> + Send {
         let traces: Vec<Vec<SpanData>> = group_into_traces(batch);
 
-        let chunks: Vec<dd_proto::TraceChunk> = traces
+        let mut chunks: Vec<dd_proto::TraceChunk> = traces
             .into_iter()
             .map(|spans| {
                 trace_into_chunk(
@@ -576,6 +576,8 @@ impl DatadogExporter {
                 )
             })
             .collect();
+
+        mark_root_spans(&mut chunks);
 
         let traces = self.trace_into_tracer(chunks);
 
@@ -604,5 +606,43 @@ impl DatadogExporter {
             }
             Ok(())
         })
+    }
+}
+
+fn mark_root_spans(trace_chunks: &mut Vec<TraceChunk>) {
+    for chunk in trace_chunks {
+        let mut service_by_parent_id = HashMap::with_capacity(chunk.spans.len());
+        for span in &chunk.spans {
+            service_by_parent_id.insert(span.parent_id, span.service.clone());
+        }
+
+        chunk
+            .spans
+            .iter_mut()
+            .filter(|span| {
+                // no parent
+                if span.parent_id == 0 {
+                    return true;
+                }
+
+                let parent = span.parent_id;
+                match service_by_parent_id.get(&parent) {
+                    Some(parent_service) => {
+                        // parent is not in the same service
+                        if *parent_service != span.service {
+                            true
+                        }
+                        // anything else is not a root level span
+                        else {
+                            false
+                        }
+                    }
+                    // parent is not in the current chunk
+                    None => true,
+                }
+            })
+            .for_each(|span| {
+                span.metrics.insert("_top_level".to_string(), 1.0);
+            })
     }
 }
