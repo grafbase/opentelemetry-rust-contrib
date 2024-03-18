@@ -44,7 +44,7 @@
 #![deny(unused_crate_dependencies)]
 
 pub(crate) mod dd_proto {
-    include!(concat!(env!("OUT_DIR"), "/dd_trace.rs"));
+    include!(concat!(env!("OUT_DIR"), "/datadog.trace.rs"));
 }
 
 mod exporter;
