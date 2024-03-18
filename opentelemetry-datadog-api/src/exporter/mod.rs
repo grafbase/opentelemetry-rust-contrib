@@ -629,7 +629,6 @@ impl DatadogExporter {
                     .client
                     .post(self.stats_request_url.to_string())
                     .header(http::header::CONTENT_TYPE, STATS_DD_CONTENT_TYPE)
-                    .header(http::header::CONTENT_ENCODING, "gzip")
                     .header("X-Datadog-Reported-Languages", "rust")
                     .header(DEFAULT_DD_API_KEY_HEADER, self.key.clone())
                     .body(stats);
