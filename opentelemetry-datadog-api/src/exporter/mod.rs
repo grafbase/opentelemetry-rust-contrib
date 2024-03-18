@@ -497,7 +497,10 @@ fn otel_span_to_dd_span(exporter: &DatadogExporter, span: SpanData) -> dd_proto:
             Status::Error { .. } => 1,
         },
         meta,
-        metrics: BTreeMap::new(),
+        metrics: BTreeMap::from_iter([
+            ("_dd.measured".to_string(), 1.0),
+            ("_sampling_priority_v1".to_string(), 1.0),
+        ]),
         meta_struct: BTreeMap::new(),
         span_links: span
             .links
@@ -616,23 +619,23 @@ impl DatadogExporter {
                 .post(self.trace_request_url.to_string())
                 .header(http::header::CONTENT_TYPE, TRACES_DD_CONTENT_TYPE)
                 .header("X-Datadog-Reported-Languages", "rust")
-                .header("Datadog-Client-Computed-Stats", "true")
                 .header(DEFAULT_DD_API_KEY_HEADER, self.key.clone())
                 .body(trace);
 
             send_request(trace_request).await?;
 
-            //if let Ok(stats) = stats {
-            let stats_request = self
-                .client
-                .post(self.stats_request_url.to_string())
-                .header(http::header::CONTENT_TYPE, STATS_DD_CONTENT_TYPE)
-                .header("X-Datadog-Reported-Languages", "rust")
-                .header(DEFAULT_DD_API_KEY_HEADER, self.key.clone())
-                .body(stats.unwrap());
+            if let Ok(stats) = stats {
+                let stats_request = self
+                    .client
+                    .post(self.stats_request_url.to_string())
+                    .header(http::header::CONTENT_TYPE, STATS_DD_CONTENT_TYPE)
+                    .header(http::header::CONTENT_ENCODING, "gzip")
+                    .header("X-Datadog-Reported-Languages", "rust")
+                    .header(DEFAULT_DD_API_KEY_HEADER, self.key.clone())
+                    .body(stats);
 
-            send_request(stats_request).await?;
-            //}
+                send_request(stats_request).await?;
+            }
 
             Ok(())
         })
