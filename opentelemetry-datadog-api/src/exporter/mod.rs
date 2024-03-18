@@ -601,7 +601,7 @@ impl DatadogExporter {
             agent_env: self.env.clone(),
             stats: client_stats,
             agent_version: VERSION.to_string(),
-            client_computed: false,
+            client_computed: true,
             split_payload: false,
         };
 
@@ -709,9 +709,9 @@ impl DatadogExporter {
 
 fn mark_root_spans(trace_chunks: &mut Vec<TraceChunk>) {
     for chunk in trace_chunks {
-        let mut index_by_span = HashMap::with_capacity(chunk.spans.len());
+        let mut service_by_parent_id = HashMap::with_capacity(chunk.spans.len());
         for span in &chunk.spans {
-            index_by_span.insert(span.parent_id, span.service.clone());
+            service_by_parent_id.insert(span.parent_id, span.service.clone());
         }
 
         chunk
@@ -724,8 +724,7 @@ fn mark_root_spans(trace_chunks: &mut Vec<TraceChunk>) {
                 }
 
                 let parent = span.parent_id;
-
-                match index_by_span.get(&parent) {
+                match service_by_parent_id.get(&parent) {
                     Some(parent_service) => {
                         // parent is not in the same service
                         if *parent_service != span.service {
