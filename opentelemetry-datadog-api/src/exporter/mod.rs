@@ -31,7 +31,9 @@ use std::time::{Duration, SystemTime};
 
 use crate::dd_proto;
 
-use crate::dd_proto::{ClientGroupedStats, ClientStatsBucket, ClientStatsPayload, SpanLink};
+use crate::dd_proto::{
+    ClientGroupedStats, ClientStatsBucket, ClientStatsPayload, SpanLink, TraceChunk,
+};
 #[cfg(not(feature = "reqwest-client"))]
 use reqwest as _;
 use reqwest::{Client, RequestBuilder};
@@ -449,37 +451,36 @@ pub(crate) fn u128_to_u64s(n: u128) -> [u64; 2] {
     ]
 }
 
-fn trace_into_dd_tracer_payload(exporter: &DatadogExporter, trace: SpanData) -> dd_proto::Span {
-    let trace_id = trace.span_context.trace_id();
-    let span_id: SpanId = trace.span_context.span_id();
+fn otel_span_to_dd_span(exporter: &DatadogExporter, span: SpanData) -> dd_proto::Span {
+    let trace_id = span.span_context.trace_id();
+    let span_id: SpanId = span.span_context.span_id();
     let span_id = u64::from_be_bytes(span_id.to_bytes());
-    let parent_id = trace.parent_span_id;
+    let parent_id = span.parent_span_id;
     let parent_id = u64::from_be_bytes(parent_id.to_bytes());
 
-    let span_name = trace.name;
+    let span_name = span.name;
     let [t0, _t1] = u128_to_u64s(u128::from_be_bytes(trace_id.to_bytes()));
 
     #[allow(clippy::cast_possible_truncation)]
-    let start = trace
+    let start = span
         .start_time
         .duration_since(SystemTime::UNIX_EPOCH)
         .unwrap()
         .as_nanos() as i64;
     #[allow(clippy::cast_possible_truncation)]
-    let duration = trace
+    let duration = span
         .end_time
-        .duration_since(trace.start_time)
+        .duration_since(span.start_time)
         .unwrap_or_default()
         .as_nanos() as i64;
 
-    let mut meta = trace
+    let mut meta = span
         .attributes
         .into_iter()
         .map(|key_value| (key_value.key.to_string(), key_value.value.to_string()))
         .collect::<BTreeMap<String, String>>();
 
     meta.extend(exporter.tags.clone());
-    meta.insert("_dd.apm.enabled".to_string(), 0.to_string());
 
     dd_proto::Span {
         service: exporter.service_name.clone(),
@@ -491,14 +492,14 @@ fn trace_into_dd_tracer_payload(exporter: &DatadogExporter, trace: SpanData) -> 
         parent_id,
         start,
         duration,
-        error: match trace.status {
+        error: match span.status {
             Status::Unset | Status::Ok => 0,
             Status::Error { .. } => 1,
         },
         meta,
         metrics: BTreeMap::new(),
         meta_struct: BTreeMap::new(),
-        span_links: trace
+        span_links: span
             .links
             .into_iter()
             .map(|link| SpanLink {
@@ -553,8 +554,7 @@ impl DatadogExporter {
     }
 
     fn trace_build(&self, tracer: Vec<dd_proto::TracerPayload>) -> dd_proto::AgentPayload {
-        let mut tags = self.tags.clone();
-        tags.insert("_dd.apm.enabled".to_string(), 0.to_string());
+        let tags = self.tags.clone();
 
         dd_proto::AgentPayload {
             host_name: self.host_name.clone(),
@@ -578,21 +578,70 @@ impl DatadogExporter {
     ) -> impl Future<Output = trace::ExportResult> + Send + '_ {
         let traces: Vec<Vec<SpanData>> = group_into_traces(batch);
 
-        let chunks: Vec<dd_proto::TraceChunk> = traces
+        let mut chunks: Vec<dd_proto::TraceChunk> = traces
             .into_iter()
             .map(|spans| {
                 trace_into_chunk(
                     self.tags.clone(),
                     spans
                         .into_iter()
-                        .map(|trace| trace_into_dd_tracer_payload(self, trace))
+                        .map(|trace| otel_span_to_dd_span(self, trace))
                         .collect(),
                 )
             })
             .collect();
 
-        let client_stats = chunks
-            .iter()
+        let client_stats = self.compute_client_stats_for_chunks(chunks.iter());
+        mark_root_spans(&mut chunks);
+
+        let traces = self.trace_into_tracer(chunks);
+
+        let stats = dd_proto::StatsPayload {
+            agent_hostname: self.host_name.clone(),
+            agent_env: self.env.clone(),
+            stats: client_stats,
+            agent_version: VERSION.to_string(),
+            client_computed: false,
+            split_payload: false,
+        };
+
+        let stats = model::encode_stats(stats).map_err(|err| TraceError::from(err));
+
+        let trace = self.trace_build(vec![traces]);
+        let trace = trace.encode_to_vec();
+
+        SendWrapper::new(async move {
+            let trace_request = self
+                .client
+                .post(self.trace_request_url.to_string())
+                .header(http::header::CONTENT_TYPE, TRACES_DD_CONTENT_TYPE)
+                .header("X-Datadog-Reported-Languages", "rust")
+                .header(DEFAULT_DD_API_KEY_HEADER, self.key.clone())
+                .body(trace);
+
+            send_request(trace_request).await?;
+
+            //if let Ok(stats) = stats {
+            let stats_request = self
+                .client
+                .post(self.stats_request_url.to_string())
+                .header(http::header::CONTENT_TYPE, STATS_DD_CONTENT_TYPE)
+                .header("X-Datadog-Reported-Languages", "rust")
+                .header(DEFAULT_DD_API_KEY_HEADER, self.key.clone())
+                .body(stats.unwrap());
+
+            send_request(stats_request).await?;
+            //}
+
+            Ok(())
+        })
+    }
+
+    fn compute_client_stats_for_chunks<'a>(
+        &self,
+        chunks: impl Iterator<Item = &'a TraceChunk>,
+    ) -> Vec<ClientStatsPayload> {
+        chunks
             .map(|chunk| {
                 let root = chunk.spans.first();
                 let leaf = chunk.spans.last();
@@ -655,49 +704,19 @@ impl DatadogExporter {
                     ..Default::default()
                 }
             })
-            .collect_vec();
+            .collect_vec()
+    }
+}
 
-        let traces = self.trace_into_tracer(chunks);
-
-        let stats = dd_proto::StatsPayload {
-            agent_hostname: self.host_name.clone(),
-            agent_env: self.env.clone(),
-            stats: client_stats,
-            agent_version: VERSION.to_string(),
-            client_computed: false,
-            split_payload: false,
-        };
-
-        let stats = model::encode_stats(stats).map_err(|err| TraceError::from(err));
-
-        let trace = self.trace_build(vec![traces]);
-        let trace = trace.encode_to_vec();
-
-        SendWrapper::new(async move {
-            let trace_request = self
-                .client
-                .post(self.trace_request_url.to_string())
-                .header(http::header::CONTENT_TYPE, TRACES_DD_CONTENT_TYPE)
-                .header("X-Datadog-Reported-Languages", "rust")
-                .header(DEFAULT_DD_API_KEY_HEADER, self.key.clone())
-                .body(trace);
-
-            send_request(trace_request).await?;
-
-            if let Ok(stats) = stats {
-                let stats_request = self
-                    .client
-                    .post(self.stats_request_url.to_string())
-                    .header(http::header::CONTENT_TYPE, STATS_DD_CONTENT_TYPE)
-                    .header("X-Datadog-Reported-Languages", "rust")
-                    .header(DEFAULT_DD_API_KEY_HEADER, self.key.clone())
-                    .body(stats);
-
-                send_request(stats_request).await?;
-            }
-
-            Ok(())
-        })
+fn mark_root_spans(trace_chunks: &mut Vec<TraceChunk>) {
+    for chunk in trace_chunks {
+        chunk
+            .spans
+            .iter_mut()
+            .filter(|span| span.parent_id == 0)
+            .for_each(|span| {
+                span.metrics.insert("_top_level".to_string(), 1.0);
+            })
     }
 }
 
