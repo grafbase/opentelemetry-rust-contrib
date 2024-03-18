@@ -29,10 +29,10 @@ use std::future::Future;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
+use crate::dd_proto;
 #[cfg(not(feature = "reqwest-client"))]
 use reqwest as _;
 use reqwest::{Client, RequestBuilder};
-use crate::dd_proto;
 
 const DEFAULT_SITE_ENDPOINT: &str = "https://trace.agent.datadoghq.eu/";
 const DEFAULT_DD_TRACES_PATH: &str = "api/v0.2/traces";
@@ -611,7 +611,10 @@ impl DatadogExporter {
             let trace_request = self
                 .client
                 .post(self.trace_request_url.to_string())
-                .header(http::header::CONTENT_TYPE.to_string(), TRACES_DD_CONTENT_TYPE)
+                .header(
+                    http::header::CONTENT_TYPE.to_string(),
+                    TRACES_DD_CONTENT_TYPE,
+                )
                 .header("X-Datadog-Reported-Languages", "rust")
                 .header(DEFAULT_DD_API_KEY_HEADER, self.key.clone())
                 .body(trace);
@@ -622,7 +625,10 @@ impl DatadogExporter {
                 let stats_request = self
                     .client
                     .post(self.stats_request_url.to_string())
-                    .header(http::header::CONTENT_TYPE.to_string(), STATS_DD_CONTENT_TYPE)
+                    .header(
+                        http::header::CONTENT_TYPE.to_string(),
+                        STATS_DD_CONTENT_TYPE,
+                    )
                     .header("X-Datadog-Reported-Languages", "rust")
                     .header(DEFAULT_DD_API_KEY_HEADER, self.key.clone())
                     .body(stats);
