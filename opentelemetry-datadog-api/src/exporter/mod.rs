@@ -30,6 +30,7 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 use crate::dd_proto;
+
 #[cfg(not(feature = "reqwest-client"))]
 use reqwest as _;
 use reqwest::{Client, RequestBuilder};
