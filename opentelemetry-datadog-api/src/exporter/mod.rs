@@ -23,7 +23,7 @@ use opentelemetry_semantic_conventions as semcov;
 use prost::Message;
 use send_wrapper::SendWrapper;
 use std::cell::RefCell;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::convert::TryInto;
 use std::future::Future;
 use std::sync::Arc;
@@ -605,7 +605,7 @@ impl DatadogExporter {
             split_payload: false,
         };
 
-        let stats = model::encode_stats(stats).map_err(|err| TraceError::from(err));
+        let stats = model::encode_stats(stats).map_err(TraceError::from);
 
         let trace = self.trace_build(vec![traces]);
         let trace = trace.encode_to_vec();
@@ -616,6 +616,7 @@ impl DatadogExporter {
                 .post(self.trace_request_url.to_string())
                 .header(http::header::CONTENT_TYPE, TRACES_DD_CONTENT_TYPE)
                 .header("X-Datadog-Reported-Languages", "rust")
+                .header("Datadog-Client-Computed-Stats", "true")
                 .header(DEFAULT_DD_API_KEY_HEADER, self.key.clone())
                 .body(trace);
 
@@ -651,7 +652,7 @@ impl DatadogExporter {
                     .iter()
                     .group_by(|span| &span.name)
                     .into_iter()
-                    .map(|(span_name, grouped_by_span_name)| {
+                    .flat_map(|(span_name, grouped_by_span_name)| {
                         grouped_by_span_name
                             .group_by(|span| {
                                 span.meta
@@ -659,7 +660,7 @@ impl DatadogExporter {
                                     .or_else(|| span.meta.get("http.status_code"))
                             })
                             .into_iter()
-                            .map(|(http_status, spans)| {
+                            .flat_map(|(http_status, spans)| {
                                 let status: http::StatusCode = http_status
                                     .and_then(|status| status.parse().ok())
                                     .unwrap_or_default();
@@ -680,10 +681,8 @@ impl DatadogExporter {
                                     }
                                 })
                             })
-                            .flatten()
                             .collect_vec()
                     })
-                    .flatten()
                     .collect_vec();
 
                 ClientStatsPayload {
@@ -710,10 +709,37 @@ impl DatadogExporter {
 
 fn mark_root_spans(trace_chunks: &mut Vec<TraceChunk>) {
     for chunk in trace_chunks {
+        let mut index_by_span = HashMap::with_capacity(chunk.spans.len());
+        for span in &chunk.spans {
+            index_by_span.insert(span.parent_id, span.service.clone());
+        }
+
         chunk
             .spans
             .iter_mut()
-            .filter(|span| span.parent_id == 0)
+            .filter(|span| {
+                // no parent
+                if span.parent_id == 0 {
+                    return true;
+                }
+
+                let parent = span.parent_id;
+
+                match index_by_span.get(&parent) {
+                    Some(parent_service) => {
+                        // parent is not in the same service
+                        if *parent_service != span.service {
+                            true
+                        }
+                        // anything else is not a root level span
+                        else {
+                            false
+                        }
+                    }
+                    // parent is not in the current chunk
+                    None => true,
+                }
+            })
             .for_each(|span| {
                 span.metrics.insert("_top_level".to_string(), 1.0);
             })
