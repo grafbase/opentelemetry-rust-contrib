@@ -587,7 +587,10 @@ impl DatadogExporter {
         let request = self
             .client
             .post(self.request_url.to_string())
-            .header(http::header::CONTENT_TYPE, DEFAULT_DD_CONTENT_TYPE)
+            .header(
+                http::header::CONTENT_TYPE.to_string(),
+                DEFAULT_DD_CONTENT_TYPE,
+            )
             .header("X-Datadog-Reported-Languages", "rust")
             .header(DEFAULT_DD_API_KEY_HEADER, self.key.clone())
             .body(trace);
