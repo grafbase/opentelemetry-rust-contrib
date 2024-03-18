@@ -29,14 +29,10 @@ use std::future::Future;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
-use crate::dd_proto;
-
-use crate::dd_proto::{
-    ClientGroupedStats, ClientStatsBucket, ClientStatsPayload, SpanLink, TraceChunk,
-};
 #[cfg(not(feature = "reqwest-client"))]
 use reqwest as _;
 use reqwest::{Client, RequestBuilder};
+use crate::dd_proto;
 
 const DEFAULT_SITE_ENDPOINT: &str = "https://trace.agent.datadoghq.eu/";
 const DEFAULT_DD_TRACES_PATH: &str = "api/v0.2/traces";
@@ -505,7 +501,7 @@ fn otel_span_to_dd_span(exporter: &DatadogExporter, span: SpanData) -> dd_proto:
         span_links: span
             .links
             .into_iter()
-            .map(|link| SpanLink {
+            .map(|link| dd_proto::SpanLink {
                 trace_id: u128::from_be_bytes(link.span_context.trace_id().to_bytes()) as u64,
                 trace_id_high: 0,
                 span_id: u64::from_be_bytes(link.span_context.span_id().to_bytes()),
@@ -522,11 +518,9 @@ fn otel_span_to_dd_span(exporter: &DatadogExporter, span: SpanData) -> dd_proto:
 }
 
 fn trace_into_chunk(
-    mut tags: BTreeMap<String, String>,
+    tags: BTreeMap<String, String>,
     spans: Vec<dd_proto::Span>,
 ) -> dd_proto::TraceChunk {
-    tags.insert("_dd.apm.enabled".to_string(), 0.to_string());
-
     dd_proto::TraceChunk {
         // This should not happen for Datadog originated traces, but in case this field is not populated
         // we default to 1 (https://github.com/DataDog/datadog-agent/blob/eac2327/pkg/trace/sampler/sampler.go#L54-L55),
@@ -617,7 +611,7 @@ impl DatadogExporter {
             let trace_request = self
                 .client
                 .post(self.trace_request_url.to_string())
-                .header(http::header::CONTENT_TYPE, TRACES_DD_CONTENT_TYPE)
+                .header(http::header::CONTENT_TYPE.to_string(), TRACES_DD_CONTENT_TYPE)
                 .header("X-Datadog-Reported-Languages", "rust")
                 .header(DEFAULT_DD_API_KEY_HEADER, self.key.clone())
                 .body(trace);
@@ -628,7 +622,7 @@ impl DatadogExporter {
                 let stats_request = self
                     .client
                     .post(self.stats_request_url.to_string())
-                    .header(http::header::CONTENT_TYPE, STATS_DD_CONTENT_TYPE)
+                    .header(http::header::CONTENT_TYPE.to_string(), STATS_DD_CONTENT_TYPE)
                     .header("X-Datadog-Reported-Languages", "rust")
                     .header(DEFAULT_DD_API_KEY_HEADER, self.key.clone())
                     .body(stats);
@@ -642,8 +636,8 @@ impl DatadogExporter {
 
     fn compute_client_stats_for_chunks<'a>(
         &self,
-        chunks: impl Iterator<Item = &'a TraceChunk>,
-    ) -> Vec<ClientStatsPayload> {
+        chunks: impl Iterator<Item = &'a dd_proto::TraceChunk>,
+    ) -> Vec<dd_proto::ClientStatsPayload> {
         chunks
             .map(|chunk| {
                 let root = chunk.spans.first();
@@ -670,7 +664,7 @@ impl DatadogExporter {
                                 let errors = if status.is_success() { 0 } else { hits };
 
                                 spans.into_iter().map(move |named_span_with_status| {
-                                    ClientGroupedStats {
+                                    dd_proto::ClientGroupedStats {
                                         service: named_span_with_status.service.clone(),
                                         name: span_name.to_string(),
                                         resource: named_span_with_status.resource.clone(),
@@ -688,11 +682,11 @@ impl DatadogExporter {
                     })
                     .collect_vec();
 
-                ClientStatsPayload {
+                dd_proto::ClientStatsPayload {
                     hostname: self.host_name.clone(),
                     env: self.env.clone(),
                     version: self.app_version.clone(),
-                    stats: vec![ClientStatsBucket {
+                    stats: vec![dd_proto::ClientStatsBucket {
                         start: root.map(|root| root.start).unwrap_or_default() as u64,
                         duration: leaf.map(|leaf| leaf.duration).unwrap_or_default() as u64,
                         stats: client_group_stats,
@@ -710,7 +704,7 @@ impl DatadogExporter {
     }
 }
 
-fn mark_root_spans(trace_chunks: &mut Vec<TraceChunk>) {
+fn mark_root_spans(trace_chunks: &mut Vec<dd_proto::TraceChunk>) {
     for chunk in trace_chunks {
         let mut service_by_parent_id = HashMap::with_capacity(chunk.spans.len());
         for span in &chunk.spans {
