@@ -32,7 +32,7 @@ opentelemetry = { workspace = true, features = ["trace"] }
 opentelemetry_sdk = { workspace = true, features = ["trace"] }
 opentelemetry-http = { workspace = true }
 opentelemetry-semantic-conventions = { workspace = true }
-reqwest = { version = "0.11", default-features = false, optional = true }
+reqwest = { version = "0.12", default-features = false, optional = true }
 rmp = "0.8"
 surf = { version = "2.0", default-features = false, optional = true }
 thiserror = "1.0"
