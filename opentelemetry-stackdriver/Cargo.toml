@@ -40,7 +40,7 @@ tls-webpki-roots = ["tonic/tls-webpki-roots"]
 propagator = ["once_cell"]
 
 [dev-dependencies]
-reqwest = "0.11.9"
+reqwest = "0.12"
 tempfile = "3.3.0"
 tokio = "1"
 tonic-build = "0.11"
