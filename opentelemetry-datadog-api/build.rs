@@ -8,6 +8,7 @@ fn main() {
 
     let mut prost_build = prost_build::Config::new();
     prost_build.btree_map(["."]);
+    prost_build.type_attribute(".", "#[derive(serde::Serialize, serde::Deserialize)]");
 
     tonic_build::configure()
         .compile_with_config(
