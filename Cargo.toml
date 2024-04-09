@@ -34,7 +34,7 @@ opentelemetry-stdout = "0.3"
 opentelemetry-semantic-conventions = "0.14"
 
 [patch.crates-io]
-reqwest = { git = "https://github.com/grafbase/reqwest", rev = "70b422e1b92fe7a85d767665afda0299d958f7ec" } # 0.12-dev-with-patches
+reqwest = { git = "https://github.com/grafbase/reqwest", rev = "5e254a782ed4199cb04b8d8f8659891ab944d419" } # 0.12-with-patches
 opentelemetry = { git = "https://github.com/grafbase/opentelemetry-rust", rev = "962cd6c1761a0b58aa65c6cbc626c91d735fd947" } # http-v1-as-any-rebased
 opentelemetry_sdk = { git = "https://github.com/grafbase/opentelemetry-rust", rev = "962cd6c1761a0b58aa65c6cbc626c91d735fd947" } # http-v1-as-any-rebased
 opentelemetry-http = { git = "https://github.com/grafbase/opentelemetry-rust", rev = "962cd6c1761a0b58aa65c6cbc626c91d735fd947" } # http-v1-as-any-rebased
