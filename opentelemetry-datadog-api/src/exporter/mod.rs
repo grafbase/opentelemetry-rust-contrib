@@ -1,12 +1,13 @@
-#[cfg(target_arch = "wasm32")]
-use getrandom as _;
-
-mod model;
+use std::cell::RefCell;
+use std::collections::{BTreeMap, HashMap};
+use std::convert::TryInto;
+use std::future::Future;
+use std::sync::Arc;
+use std::time::{Duration, SystemTime};
 
 use async_trait::async_trait;
 use http::Uri;
 use itertools::Itertools;
-pub use model::Error;
 use opentelemetry::trace::{SpanId, TraceResult};
 use opentelemetry::trace::{Status, TraceError};
 use opentelemetry::Key;
@@ -21,19 +22,19 @@ use opentelemetry_sdk::trace::SpanProcessor;
 use opentelemetry_sdk::Resource;
 use opentelemetry_semantic_conventions as semcov;
 use prost::Message;
-use send_wrapper::SendWrapper;
-use std::cell::RefCell;
-use std::collections::{BTreeMap, HashMap};
-use std::convert::TryInto;
-use std::future::Future;
-use std::sync::Arc;
-use std::time::{Duration, SystemTime};
-
-use crate::dd_proto;
-
 #[cfg(not(feature = "reqwest-client"))]
 use reqwest as _;
 use reqwest::{Client, RequestBuilder};
+use send_wrapper::SendWrapper;
+
+pub use model::Error;
+
+use crate::dd_proto;
+
+#[cfg(target_arch = "wasm32")]
+use getrandom as _;
+
+mod model;
 
 const DEFAULT_SITE_ENDPOINT: &str = "https://trace.agent.datadoghq.eu/";
 const DEFAULT_DD_TRACES_PATH: &str = "api/v0.2/traces";
@@ -474,6 +475,7 @@ fn otel_span_to_dd_span(exporter: &DatadogExporter, span: SpanData) -> dd_proto:
         .collect::<BTreeMap<String, String>>();
 
     meta.extend(exporter.tags.clone());
+    meta.insert("dd_service".to_string(), exporter.service_name.clone());
 
     dd_proto::Span {
         service: exporter.service_name.clone(),
@@ -524,7 +526,7 @@ fn trace_into_chunk(
         // which is what the Datadog trace-agent is doing for OTLP originated traces, as per
         // https://github.com/DataDog/datadog-agent/blob/3ea2eb4/pkg/trace/api/otlp.go#L309.
         priority: 100i32,
-        origin: "lambda".to_string(),
+        origin: "cloudflare".to_string(),
         spans,
         tags,
         dropped_trace: false,
@@ -657,29 +659,49 @@ impl DatadogExporter {
                                 span.meta
                                     .get("http.response.status_code")
                                     .or_else(|| span.meta.get("http.status_code"))
+                                    .and_then(|status_code| status_code.parse::<u32>().ok())
+                                    .unwrap_or_default()
                             })
                             .into_iter()
-                            .flat_map(|(http_status, spans)| {
-                                let status: http::StatusCode = http_status
-                                    .and_then(|status| status.parse().ok())
-                                    .unwrap_or_default();
-                                let hits = spans.size_hint().0;
-                                let errors = if status.is_success() { 0 } else { hits };
+                            .map(|(status, spans)| {
+                                let grouped_spans = spans.into_iter().collect::<Vec<_>>();
+                                let named_span_with_status = grouped_spans.first().unwrap();
 
-                                spans.into_iter().map(move |named_span_with_status| {
-                                    dd_proto::ClientGroupedStats {
-                                        service: named_span_with_status.service.clone(),
-                                        name: span_name.to_string(),
-                                        resource: named_span_with_status.resource.clone(),
-                                        http_status_code: status.as_u16() as u32,
-                                        r#type: named_span_with_status.r#type.to_string(),
-                                        hits: hits as u64,
-                                        errors: errors as u64,
-                                        duration: named_span_with_status.duration as u64,
-                                        peer_tags: vec!["_dd.base_service".to_string()],
-                                        ..Default::default()
+                                let hits = grouped_spans.len();
+                                let mut errors = 0;
+                                let mut top_level_hits = 0;
+
+                                grouped_spans.iter().for_each(|span| {
+                                    if span.metrics.get("_top_level").is_some() {
+                                        top_level_hits += 1;
                                     }
-                                })
+
+                                    // todo: improve the error check
+                                    // for now I'll just use the group key which is the status from the span metadata
+                                    // any span with a status 0 won't be considered for error
+                                    if status != 0 && !(200..=299).contains(&status) {
+                                        errors += 1;
+                                    }
+                                });
+
+                                dd_proto::ClientGroupedStats {
+                                    service: named_span_with_status.service.clone(),
+                                    name: span_name.to_string(),
+                                    resource: named_span_with_status.resource.clone(),
+                                    http_status_code: status,
+                                    r#type: named_span_with_status.r#type.to_string(),
+                                    hits: hits as u64,
+                                    errors: errors as u64,
+                                    duration: named_span_with_status.duration as u64,
+                                    peer_tags: vec!["_dd.base_service".to_string()],
+                                    top_level_hits,
+                                    span_kind: named_span_with_status
+                                        .meta
+                                        .get("span.kind")
+                                        .cloned()
+                                        .unwrap_or_default(),
+                                    ..Default::default()
+                                }
                             })
                             .collect_vec()
                     })
@@ -700,6 +722,7 @@ impl DatadogExporter {
                     runtime_id: "cloudflare".to_string(),
                     service: self.service_name.clone(),
                     container_id: "cloudflare".to_string(),
+                    agent_aggregation: "counts".to_string(),
                     ..Default::default()
                 }
             })
@@ -741,6 +764,7 @@ fn mark_root_spans(trace_chunks: &mut Vec<dd_proto::TraceChunk>) {
             })
             .for_each(|span| {
                 span.metrics.insert("_top_level".to_string(), 1.0);
+                span.metrics.insert("_dd.top_level".to_string(), 1.0);
                 span.metrics.insert("_dd.agent_psr".to_string(), 1.0);
                 span.metrics
                     .insert("_sampling_priority_v1".to_string(), 1.0);
@@ -751,7 +775,7 @@ fn mark_root_spans(trace_chunks: &mut Vec<dd_proto::TraceChunk>) {
                 span.meta
                     .insert("_dd.compute_stats".to_string(), "1".to_string());
                 span.meta
-                    .insert("_dd.origin".to_string(), "lambda".to_string());
+                    .insert("_dd.origin".to_string(), "cloudflare".to_string());
                 span.meta.insert("_dd.p.dm".to_string(), "-0".to_string());
             })
     }
