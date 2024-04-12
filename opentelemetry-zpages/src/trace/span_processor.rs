@@ -4,6 +4,7 @@
 //! for further process.
 //!
 //! [`SpanAggregator`]:../struct.SpanAggregator.html
+use std::any::Any;
 use crate::trace::TracezMessage;
 use async_channel::Sender;
 use opentelemetry::{trace::TraceResult, Context};
@@ -56,5 +57,9 @@ impl SpanProcessor for ZPagesSpanProcessor {
     fn shutdown(&self) -> TraceResult<()> {
         // do nothing
         Ok(())
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
     }
 }
