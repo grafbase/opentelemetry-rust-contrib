@@ -1,3 +1,4 @@
+use std::any::Any;
 use std::fmt::Debug;
 
 use opentelemetry::logs::LogResult;
@@ -57,5 +58,9 @@ impl opentelemetry_sdk::logs::LogProcessor for ReentrantLogProcessor {
         name: &str,
     ) -> bool {
         self.event_exporter.event_enabled(level, target, name)
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
     }
 }

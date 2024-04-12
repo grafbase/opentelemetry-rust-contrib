@@ -1,25 +1,20 @@
-use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap};
 use std::convert::TryInto;
 use std::future::Future;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
-use async_trait::async_trait;
+use base64::Engine;
 use http::Uri;
 use itertools::Itertools;
-use opentelemetry::trace::{SpanId, TraceResult};
+use opentelemetry::logs::{AnyValue, Severity};
+use opentelemetry::trace::SpanId;
 use opentelemetry::trace::{Status, TraceError};
 use opentelemetry::Key;
-use opentelemetry::{trace::TracerProvider, KeyValue};
-use opentelemetry_sdk::export::trace;
+use opentelemetry_sdk::export::logs::LogData;
 use opentelemetry_sdk::export::trace::SpanData;
 use opentelemetry_sdk::resource::ResourceDetector;
 use opentelemetry_sdk::resource::SdkProvidedResourceDetector;
-use opentelemetry_sdk::trace::Config;
-use opentelemetry_sdk::trace::Span;
-use opentelemetry_sdk::trace::SpanProcessor;
-use opentelemetry_sdk::Resource;
 use opentelemetry_semantic_conventions as semcov;
 use prost::Message;
 #[cfg(not(feature = "reqwest-client"))]
@@ -36,18 +31,24 @@ use getrandom as _;
 
 mod model;
 
-const DEFAULT_SITE_ENDPOINT: &str = "https://trace.agent.datadoghq.eu/";
+const DEFAULT_TRACING_ENDPOINT: &str = "https://trace.agent.datadoghq.eu/";
+const DEFAULT_LOGS_INTAKE_ENDPOINT: &str = "https://http-intake.logs.datadoghq.com/";
 const DEFAULT_DD_TRACES_PATH: &str = "api/v0.2/traces";
 const DEFAULT_DD_STATS_PATH: &str = "api/v0.2/stats";
+const DEFAULT_DD_LOGS_PATH: &str = "api/v2/logs";
 const TRACES_DD_CONTENT_TYPE: &str = "application/x-protobuf";
 const STATS_DD_CONTENT_TYPE: &str = "application/msgpack";
+const LOGS_DD_CONTENT_TYPE: &str = "application/json";
 const DEFAULT_DD_API_KEY_HEADER: &str = "DD-Api-Key";
-const DEFAULT_FLUSH_SIZE: usize = 500;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
-thread_local! {
-    static SPANS: RefCell<Vec<SpanData>> = RefCell::new(Vec::new());
+#[derive(Debug, thiserror::Error)]
+pub enum DatadogExportError {
+    #[error("reqwest error: {0}")]
+    Reqwest(#[from] reqwest::Error),
+    #[error("http error: {0}")]
+    Http(http::StatusCode, String),
 }
 
 /// Datadog span exporter
@@ -57,6 +58,7 @@ pub struct DatadogExporter {
     client: Arc<Client>,
     trace_request_url: Uri,
     stats_request_url: Uri,
+    logs_request_url: Uri,
     service_name: String,
     env: String,
     tags: BTreeMap<String, String>,
@@ -65,13 +67,13 @@ pub struct DatadogExporter {
     runtime_id: String,
     container_id: String,
     app_version: String,
-    flush_size: usize,
 }
 
 impl DatadogExporter {
     #[allow(clippy::too_many_arguments)]
     fn new(
         service_name: String,
+        logs_request_url: Uri,
         stats_request_url: Uri,
         trace_request_url: Uri,
         client: Arc<Client>,
@@ -82,10 +84,10 @@ impl DatadogExporter {
         runtime_id: String,
         container_id: String,
         app_version: String,
-        flush_size: usize,
     ) -> Self {
         DatadogExporter {
             client,
+            logs_request_url,
             stats_request_url,
             trace_request_url,
             service_name,
@@ -96,7 +98,6 @@ impl DatadogExporter {
             runtime_id,
             container_id,
             app_version,
-            flush_size,
         }
     }
 }
@@ -110,26 +111,25 @@ pub fn new_pipeline() -> DatadogPipelineBuilder {
 /// Builder for `ExporterConfig` struct.
 #[derive(Debug)]
 pub struct DatadogPipelineBuilder {
-    agent_endpoint: String,
+    trace_endpoint: String,
+    logs_endpoint: String,
     api_key: Option<String>,
     app_version: Option<String>,
     client: Option<Arc<Client>>,
     container_id: Option<String>,
     env: Option<String>,
-    flush_size: Option<usize>,
     host_name: Option<String>,
     runtime_id: Option<String>,
     service_name: Option<String>,
     tags: Option<BTreeMap<String, String>>,
-    trace_config: Option<opentelemetry_sdk::trace::Config>,
 }
 
 impl Default for DatadogPipelineBuilder {
     fn default() -> Self {
         DatadogPipelineBuilder {
+            trace_endpoint: DEFAULT_TRACING_ENDPOINT.to_string(),
+            logs_endpoint: DEFAULT_LOGS_INTAKE_ENDPOINT.to_string(),
             service_name: None,
-            agent_endpoint: DEFAULT_SITE_ENDPOINT.to_string(),
-            trace_config: None,
             api_key: None,
             #[cfg(not(feature = "reqwest-client"))]
             client: None,
@@ -141,86 +141,7 @@ impl Default for DatadogPipelineBuilder {
             runtime_id: None,
             container_id: None,
             app_version: None,
-            flush_size: None,
         }
-    }
-}
-
-/// A [`SpanProcessor`] that exports asynchronously when asked to do it.
-#[derive(Debug)]
-#[allow(clippy::type_complexity)]
-pub struct WASMWorkerSpanProcessor {
-    exporter: DatadogExporter,
-    flush_size: usize,
-}
-
-impl WASMWorkerSpanProcessor {
-    pub(crate) fn new(exporter: DatadogExporter, flush_size: usize) -> Self {
-        WASMWorkerSpanProcessor {
-            exporter,
-            flush_size,
-        }
-    }
-}
-
-#[async_trait]
-pub trait SpanProcessExt {
-    async fn force_flush(&self) -> TraceResult<()>;
-}
-
-#[async_trait]
-impl SpanProcessExt for WASMWorkerSpanProcessor {
-    async fn force_flush(&self) -> TraceResult<()> {
-        let to_export = {
-            SPANS.with(|spans| {
-                let mut spans = spans
-                    .try_borrow_mut()
-                    .expect("should safely succeeded given the single threaded runtime");
-
-                let export_size = if spans.len() > self.flush_size {
-                    self.flush_size
-                } else {
-                    spans.len()
-                };
-
-                spans.drain(0..export_size).collect::<Vec<_>>()
-            })
-        };
-
-        self.exporter.export(to_export).await
-    }
-}
-
-impl SpanProcessor for WASMWorkerSpanProcessor {
-    fn on_start(&self, _span: &mut Span, _cx: &opentelemetry::Context) {
-        // Ignored
-    }
-
-    fn on_end(&self, span: SpanData) {
-        SPANS.with(|spans| {
-            spans
-                .try_borrow_mut()
-                .expect("should safely succeeded given the single threaded runtime")
-                .push(span);
-        });
-    }
-
-    fn force_flush(&self) -> TraceResult<()> {
-        Err(TraceError::from(
-            "Sync flush is not supported, use `force_flush` from `SpanProcessExt`",
-        ))
-    }
-
-    fn shutdown(&mut self) -> TraceResult<()> {
-        // We ignore the Shutdown as we are in a Worker process, either it'll be shutdown by the
-        // worker termination or it'll keep existing.
-        //
-        // TODO: Better handle it later.
-        Ok(())
-    }
-
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
     }
 }
 
@@ -233,48 +154,20 @@ impl DatadogPipelineBuilder {
     ///
     /// If the Endpoint or the `APIKey` are not properly set.
     pub fn build_exporter(mut self) -> Result<DatadogExporter, TraceError> {
-        let (_, service_name) = self.build_config_and_service_name();
+        let service_name = self.service_name();
         self.build_exporter_with_service_name(service_name)
     }
 
-    fn build_config_and_service_name(&mut self) -> (Config, String) {
+    fn service_name(&mut self) -> String {
         let service_name = self.service_name.take();
-        if let Some(service_name) = service_name {
-            let config = if let Some(mut config) = self.trace_config.take() {
-                config.resource = {
-                    let without_service_name = config
-                        .resource
-                        .iter()
-                        .filter(|(k, _v)| {
-                            **k != Key::new(semcov::resource::SERVICE_NAME.to_string())
-                        })
-                        .map(|(k, v)| KeyValue::new(k.clone(), v.clone()))
-                        .collect::<Vec<KeyValue>>();
-                    std::borrow::Cow::Owned(Resource::new(without_service_name))
-                };
-                config
-            } else {
-                Config {
-                    resource: std::borrow::Cow::Owned(Resource::empty()),
-                    ..Default::default()
-                }
-            };
-            (config, service_name)
-        } else {
-            let service_name = SdkProvidedResourceDetector
+
+        service_name.unwrap_or_else(|| {
+            SdkProvidedResourceDetector
                 .detect(Duration::from_secs(0))
                 .get(Key::new(semcov::resource::SERVICE_NAME.to_string()))
                 .unwrap()
-                .to_string();
-            (
-                Config {
-                    // use a empty resource to prevent TracerProvider to assign a service name.
-                    resource: std::borrow::Cow::Owned(Resource::empty()),
-                    ..Default::default()
-                },
-                service_name,
-            )
-        }
+                .to_string()
+        })
     }
 
     fn build_exporter_with_service_name(
@@ -282,64 +175,29 @@ impl DatadogPipelineBuilder {
         service_name: String,
     ) -> Result<DatadogExporter, TraceError> {
         if let Some(client) = self.client {
-            let traces_endpoint = self.agent_endpoint.clone() + DEFAULT_DD_TRACES_PATH;
-            let stats_endpoint = self.agent_endpoint + DEFAULT_DD_STATS_PATH;
+            let traces_endpoint = self.trace_endpoint.clone() + DEFAULT_DD_TRACES_PATH;
+            let stats_endpoint = self.trace_endpoint.clone() + DEFAULT_DD_STATS_PATH;
+            let logs_endpoint = self.logs_endpoint.clone() + DEFAULT_DD_LOGS_PATH;
+
             let exporter = DatadogExporter::new(
                 service_name,
+                logs_endpoint.parse().map_err::<Error, _>(Into::into)?,
                 stats_endpoint.parse().map_err::<Error, _>(Into::into)?,
                 traces_endpoint.parse().map_err::<Error, _>(Into::into)?,
                 client,
                 self.api_key
-                    .ok_or_else(|| TraceError::Other("APIKey not provied".into()))?,
+                    .ok_or_else(|| TraceError::Other("APIKey not provided".into()))?,
                 self.env.unwrap_or_default(),
                 self.tags.unwrap_or_default(),
                 self.host_name.unwrap_or_default(),
                 self.runtime_id.unwrap_or_default(),
                 self.container_id.unwrap_or_default(),
                 self.app_version.unwrap_or_default(),
-                self.flush_size.unwrap_or(DEFAULT_FLUSH_SIZE),
             );
             Ok(exporter)
         } else {
             Err(Error::NoHttpClient.into())
         }
-    }
-
-    /// Install the Datadog worker trace exporter pipeline using a simple span processor.
-    ///
-    /// # Errors
-    ///
-    /// If the Endpoint or the `APIKey` are not properly set.
-    /// Install the Datadog worker trace exporter pipeline using a simple span processor.
-    ///
-    /// # Errors
-    ///
-    /// If the Endpoint or the `APIKey` are not properly set.
-    pub fn install(
-        mut self,
-    ) -> Result<
-        (
-            opentelemetry_sdk::trace::Tracer,
-            opentelemetry_sdk::trace::TracerProvider,
-        ),
-        TraceError,
-    > {
-        let (config, service_name) = self.build_config_and_service_name();
-        let exporter = self.build_exporter_with_service_name(service_name.clone())?;
-        let flush_size = exporter.flush_size;
-        let span_processor = WASMWorkerSpanProcessor::new(exporter, flush_size);
-        let mut provider_builder =
-            opentelemetry_sdk::trace::TracerProvider::builder().with_span_processor(span_processor);
-        provider_builder = provider_builder.with_config(config);
-        let provider = provider_builder.build();
-        let tracer = provider.versioned_tracer(
-            "opentelemetry-datadog-api",
-            Some(env!("CARGO_PKG_VERSION")),
-            None::<String>,
-            Some(vec![KeyValue::new("service", service_name)]),
-        );
-
-        Ok((tracer, provider))
     }
 
     /// Assign the service name under which to group traces
@@ -351,8 +209,15 @@ impl DatadogPipelineBuilder {
 
     /// Assign the Datadog trace endpoint
     #[must_use]
-    pub fn with_endpoint<T: Into<String>>(mut self, endpoint: T) -> Self {
-        self.agent_endpoint = endpoint.into();
+    pub fn with_tracing_endpoint<T: Into<String>>(mut self, endpoint: T) -> Self {
+        self.trace_endpoint = endpoint.into();
+        self
+    }
+
+    /// Assign the Datadog logs endpoint
+    #[must_use]
+    pub fn with_logs_endpoint<T: Into<String>>(mut self, endpoint: T) -> Self {
+        self.logs_endpoint = endpoint.into();
         self
     }
 
@@ -366,13 +231,6 @@ impl DatadogPipelineBuilder {
     #[must_use]
     pub fn with_http_client(mut self, client: Arc<Client>) -> Self {
         self.client = Some(client);
-        self
-    }
-
-    /// Assign the SDK trace configuration
-    #[must_use]
-    pub fn with_trace_config(mut self, config: opentelemetry_sdk::trace::Config) -> Self {
-        self.trace_config = Some(config);
         self
     }
 
@@ -415,13 +273,6 @@ impl DatadogPipelineBuilder {
     #[must_use]
     pub fn with_tags(mut self, tags: BTreeMap<String, String>) -> Self {
         self.tags = Some(tags);
-        self
-    }
-
-    /// Assign the tags
-    #[must_use]
-    pub fn with_flush_size(mut self, flush_size: usize) -> Self {
-        self.flush_size = Some(flush_size);
         self
     }
 }
@@ -570,12 +421,85 @@ impl DatadogExporter {
 }
 
 impl DatadogExporter {
+    /// Export logs to datadog
+    // https://docs.datadoghq.com/api/latest/logs/
+    pub fn export_logs(
+        &self,
+        batch: Vec<LogData>,
+    ) -> impl Future<Output = Result<(), DatadogExportError>> + Send + '_ {
+        #[derive(Debug, serde::Serialize)]
+        pub struct DatadogLogEntry {
+            pub ddsource: String,
+            pub ddtags: String,
+            pub hostname: String,
+            pub message: String,
+            pub service: String,
+            pub status: String,
+        }
+
+        let dd_logs = batch
+            .into_iter()
+            .filter_map(|otel_log| {
+                let mut tags = self.tags.clone();
+                tags.extend(
+                    otel_log
+                        .record
+                        .attributes
+                        .unwrap_or_default()
+                        .into_iter()
+                        .map(|(key, value)| (key.to_string(), any_to_string(value)))
+                        .collect_vec(),
+                );
+
+                tags.extend(
+                    otel_log
+                        .resource
+                        .into_iter()
+                        .map(|(key, value)| (key.to_string(), value.to_string())),
+                );
+
+                otel_log.record.body.map(|log_message| DatadogLogEntry {
+                    ddsource: "cloudflare".to_string(),
+                    ddtags: tags
+                        .iter()
+                        .map(|(lhs, rhs)| format!("{lhs}:{rhs}"))
+                        .join(","),
+                    hostname: self.host_name.to_string(),
+                    message: any_to_string(log_message),
+                    service: self.service_name.to_string(),
+                    status: otel_log
+                        .record
+                        .severity_number
+                        .unwrap_or(Severity::Debug)
+                        .name()
+                        .to_string()
+                        .to_ascii_lowercase(),
+                })
+            })
+            .collect_vec();
+
+        let payload = serde_json::to_string(&dd_logs).unwrap();
+        drop(dd_logs);
+
+        SendWrapper::new(async move {
+            let logs_request = self
+                .client
+                .post(self.logs_request_url.to_string())
+                .header(http::header::CONTENT_TYPE.to_string(), LOGS_DD_CONTENT_TYPE)
+                .header(DEFAULT_DD_API_KEY_HEADER, self.key.clone())
+                .body(payload);
+
+            send_request(logs_request).await?;
+
+            Ok(())
+        })
+    }
+
     /// Export spans to datadog
-    // TODO: Should split & batch them when it's too big, check Vector reference.
-    pub fn export(
+    pub fn export_traces(
         &self,
         batch: Vec<SpanData>,
-    ) -> impl Future<Output = trace::ExportResult> + Send + '_ {
+    ) -> impl Future<Output = Result<(), DatadogExportError>> + Send + '_ {
         let traces: Vec<Vec<SpanData>> = group_into_traces(batch);
 
         let mut chunks: Vec<dd_proto::TraceChunk> = traces
@@ -727,6 +651,12 @@ impl DatadogExporter {
                     service: self.service_name.clone(),
                     container_id: "cloudflare".to_string(),
                     agent_aggregation: "counts".to_string(),
+                    tags: self
+                        .tags
+                        .clone()
+                        .into_iter()
+                        .map(|(key, value)| format!("{key}:{value}"))
+                        .collect(),
                     ..Default::default()
                 }
             })
@@ -785,18 +715,31 @@ fn mark_root_spans(trace_chunks: &mut Vec<dd_proto::TraceChunk>) {
     }
 }
 
-async fn send_request(request: RequestBuilder) -> Result<(), TraceError> {
-    let response = match request.send().await {
-        Ok(response) => response,
-        Err(e) => return Err(TraceError::from(e.to_string())),
-    };
+async fn send_request(request: RequestBuilder) -> Result<(), DatadogExportError> {
+    let response = request.send().await?;
+    let response_status = response.status();
 
     if !response.status().is_success() {
         return match response.text().await {
-            Ok(text) => Err(TraceError::from(text)),
-            Err(e) => Err(TraceError::from(e.to_string())),
+            Ok(text) => Err(DatadogExportError::Http(response_status, text)),
+            Err(e) => Err(DatadogExportError::Http(response_status, e.to_string())),
         };
     }
 
     Ok(())
+}
+
+pub fn any_to_string(any_value: AnyValue) -> String {
+    match any_value {
+        AnyValue::Int(i) => i.to_string(),
+        AnyValue::Double(d) => d.to_string(),
+        AnyValue::String(s) => s.to_string(),
+        AnyValue::Boolean(b) => b.to_string(),
+        AnyValue::Bytes(b) => base64::engine::general_purpose::STANDARD_NO_PAD.encode(b),
+        AnyValue::ListAny(any_list) => any_list.into_iter().map(any_to_string).join(";"),
+        AnyValue::Map(any_map) => any_map
+            .into_iter()
+            .map(|(key, value)| format!("{}:{}", key, any_to_string(value)))
+            .join(";"),
+    }
 }
