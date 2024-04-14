@@ -145,7 +145,6 @@ impl Default for DatadogPipelineBuilder {
     }
 }
 
-<<<<<<< HEAD
 /// A [`SpanProcessor`] that exports asynchronously when asked to do it.
 #[derive(Debug)]
 #[allow(clippy::type_complexity)]
@@ -220,8 +219,6 @@ impl SpanProcessor for WASMWorkerSpanProcessor {
     }
 }
 
-=======
->>>>>>> 5941cb9 (feat: support logs exporting)
 impl DatadogPipelineBuilder {
     /// Building a new exporter.
     ///
@@ -606,7 +603,7 @@ impl DatadogExporter {
             split_payload: false,
         };
 
-        let stats = model::encode_stats(stats).map_err(TraceError::from);
+        let stats = rmp_serde::to_vec(&stats).map_err(|err| TraceError::from(err.to_string()));
 
         let trace = self.trace_build(vec![traces]);
         let trace = trace.encode_to_vec();
