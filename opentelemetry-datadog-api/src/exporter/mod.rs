@@ -17,6 +17,7 @@ use opentelemetry_sdk::resource::ResourceDetector;
 use opentelemetry_sdk::resource::SdkProvidedResourceDetector;
 use opentelemetry_semantic_conventions as semcov;
 use prost::Message;
+use rand::Rng;
 #[cfg(not(feature = "reqwest-client"))]
 use reqwest as _;
 use reqwest::{Client, RequestBuilder};
@@ -67,6 +68,7 @@ pub struct DatadogExporter {
     runtime_id: String,
     container_id: String,
     app_version: String,
+    sampling: u8,
 }
 
 impl DatadogExporter {
@@ -84,6 +86,7 @@ impl DatadogExporter {
         runtime_id: String,
         container_id: String,
         app_version: String,
+        sampling: u8,
     ) -> Self {
         DatadogExporter {
             client,
@@ -98,6 +101,7 @@ impl DatadogExporter {
             runtime_id,
             container_id,
             app_version,
+            sampling,
         }
     }
 }
@@ -113,6 +117,7 @@ pub fn new_pipeline() -> DatadogPipelineBuilder {
 pub struct DatadogPipelineBuilder {
     trace_endpoint: String,
     logs_endpoint: String,
+    sampling: u8,
     api_key: Option<String>,
     app_version: Option<String>,
     client: Option<Arc<Client>>,
@@ -141,6 +146,7 @@ impl Default for DatadogPipelineBuilder {
             runtime_id: None,
             container_id: None,
             app_version: None,
+            sampling: 100,
         }
     }
 }
@@ -267,6 +273,7 @@ impl DatadogPipelineBuilder {
                 self.runtime_id.unwrap_or_default(),
                 self.container_id.unwrap_or_default(),
                 self.app_version.unwrap_or_default(),
+                self.sampling,
             );
             Ok(exporter)
         } else {
@@ -349,13 +356,28 @@ impl DatadogPipelineBuilder {
         self.tags = Some(tags);
         self
     }
+
+    /// Assign the Datadog trace endpoint
+    #[must_use]
+    pub fn with_sampling(mut self, mut sampling: u8) -> Self {
+        if sampling > 100 {
+            sampling = 100;
+        }
+
+        self.sampling = sampling;
+        self
+    }
 }
 
-fn group_into_traces(spans: Vec<SpanData>) -> Vec<Vec<SpanData>> {
+fn group_into_traces(spans: Vec<SpanData>, sampling: u8) -> Vec<Vec<SpanData>> {
     spans
         .into_iter()
         .into_group_map_by(|span_data| span_data.span_context.trace_id())
         .into_values()
+        .filter(|_| {
+            let random = rand::thread_rng().gen_range(0..100);
+            random <= sampling
+        })
         .collect()
 }
 
@@ -574,7 +596,7 @@ impl DatadogExporter {
         &self,
         batch: Vec<SpanData>,
     ) -> impl Future<Output = Result<(), DatadogExportError>> + Send + '_ {
-        let traces: Vec<Vec<SpanData>> = group_into_traces(batch);
+        let traces: Vec<Vec<SpanData>> = group_into_traces(batch, self.sampling);
 
         let mut chunks: Vec<dd_proto::TraceChunk> = traces
             .into_iter()
@@ -815,5 +837,38 @@ pub fn any_to_string(any_value: AnyValue) -> String {
             .into_iter()
             .map(|(key, value)| format!("{}:{}", key, any_to_string(value)))
             .join(";"),
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use crate::exporter::group_into_traces;
+    use opentelemetry::trace::{SpanContext, SpanId, SpanKind};
+    use opentelemetry_sdk::export::trace::SpanData;
+    use std::time::SystemTime;
+
+    #[test]
+    fn test_sampling() {
+        let span = SpanData {
+            span_context: SpanContext::empty_context(),
+            parent_span_id: SpanId::INVALID,
+            span_kind: SpanKind::Client,
+            name: Default::default(),
+            start_time: SystemTime::now(),
+            end_time: SystemTime::now(),
+            attributes: vec![],
+            dropped_attributes_count: 0,
+            events: Default::default(),
+            links: Default::default(),
+            status: Default::default(),
+            resource: Default::default(),
+            instrumentation_lib: Default::default(),
+        };
+
+        let traces = group_into_traces(vec![span.clone()], 0);
+        assert!(traces.is_empty());
+
+        let traces = group_into_traces(vec![span], 100);
+        assert_eq!(traces.len(), 1);
     }
 }
