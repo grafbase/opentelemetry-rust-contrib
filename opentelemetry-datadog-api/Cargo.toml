@@ -28,6 +28,7 @@ opentelemetry-semantic-conventions = { version = "0.14" }
 prost = { version = "0.12", features = ["std"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+rand = "0.8"
 rmp = "0.8"
 rmp-serde = "1"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream", "json"], optional = true }
