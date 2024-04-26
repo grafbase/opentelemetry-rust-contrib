@@ -21,6 +21,6 @@ opentelemetry-stdout = "0.5"
 opentelemetry-semantic-conventions = "0.16"
 
 [patch.crates-io]
-opentelemetry = { git = "https://github.com/grafbase/opentelemetry-rust", rev = "a8c0bbe60797f76ca72738debe40a206efc2f8d0" } # http-v1-as-any-rebased
-opentelemetry_sdk = { git = "https://github.com/grafbase/opentelemetry-rust", rev = "a8c0bbe60797f76ca72738debe40a206efc2f8d0" } # http-v1-as-any-rebased
-opentelemetry-http = { git = "https://github.com/grafbase/opentelemetry-rust", rev = "a8c0bbe60797f76ca72738debe40a206efc2f8d0" } # http-v1-as-any-rebased
+opentelemetry = { git = "https://github.com/grafbase/opentelemetry-rust", rev = "3c80c1bb55c09f01a4da94a86d20d80e55cfd8eb" } # http-v1-as-any-rebased
+opentelemetry_sdk = { git = "https://github.com/grafbase/opentelemetry-rust", rev = "3c80c1bb55c09f01a4da94a86d20d80e55cfd8eb" } # http-v1-as-any-rebased
+opentelemetry-http = { git = "https://github.com/grafbase/opentelemetry-rust", rev = "3c80c1bb55c09f01a4da94a86d20d80e55cfd8eb" } # http-v1-as-any-rebased
