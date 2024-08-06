@@ -15,6 +15,7 @@ use opentelemetry_sdk::export::logs::LogData;
 use opentelemetry_sdk::export::trace::SpanData;
 use opentelemetry_sdk::resource::ResourceDetector;
 use opentelemetry_sdk::resource::SdkProvidedResourceDetector;
+use opentelemetry_sdk::Resource;
 use opentelemetry_semantic_conventions as semcov;
 use prost::Message;
 use rand::Rng;
@@ -69,6 +70,7 @@ pub struct DatadogExporter {
     container_id: String,
     app_version: String,
     sampling: u8,
+    resource: Option<Resource>,
 }
 
 impl DatadogExporter {
@@ -87,6 +89,7 @@ impl DatadogExporter {
         container_id: String,
         app_version: String,
         sampling: u8,
+        resource: Option<Resource>,
     ) -> Self {
         DatadogExporter {
             client,
@@ -102,6 +105,7 @@ impl DatadogExporter {
             container_id,
             app_version,
             sampling,
+            resource,
         }
     }
 }
@@ -127,6 +131,7 @@ pub struct DatadogPipelineBuilder {
     runtime_id: Option<String>,
     service_name: Option<String>,
     tags: Option<BTreeMap<String, String>>,
+    resource: Option<Resource>,
 }
 
 impl Default for DatadogPipelineBuilder {
@@ -147,6 +152,7 @@ impl Default for DatadogPipelineBuilder {
             container_id: None,
             app_version: None,
             sampling: 100,
+            resource: None,
         }
     }
 }
@@ -200,7 +206,9 @@ impl DatadogPipelineBuilder {
                 self.container_id.unwrap_or_default(),
                 self.app_version.unwrap_or_default(),
                 self.sampling,
+                self.resource,
             );
+
             Ok(exporter)
         } else {
             Err(Error::NoHttpClient.into())
@@ -291,6 +299,13 @@ impl DatadogPipelineBuilder {
         }
 
         self.sampling = sampling;
+        self
+    }
+
+    /// Sets the exporter resource
+    #[must_use]
+    pub fn with_resource(mut self, resource: Resource) -> Self {
+        self.resource = Some(resource);
         self
     }
 }
@@ -473,12 +488,13 @@ impl DatadogExporter {
                         .collect_vec(),
                 );
 
-                tags.extend(
-                    otel_log
-                        .resource
-                        .into_iter()
-                        .map(|(key, value)| (key.to_string(), value.to_string())),
-                );
+                if let Some(resource) = self.resource.as_ref() {
+                    tags.extend(
+                        resource
+                            .iter()
+                            .map(|(key, value)| (key.to_string(), value.to_string())),
+                    );
+                }
 
                 otel_log.record.body.map(|log_message| DatadogLogEntry {
                     ddsource: "cloudflare".to_string(),
